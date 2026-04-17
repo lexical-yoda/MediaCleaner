@@ -8,6 +8,28 @@ from pathlib import Path
 from dotenv import load_dotenv
 import os
 
+_NETWORK_FS_TYPES = {"cifs", "smb3", "smbfs", "nfs", "nfs4", "nfs3", "sshfs", "fuse.sshfs"}
+
+
+def _detect_network_fs(path: Path) -> str | None:
+    """Return the filesystem type if path lives on a network mount, else None."""
+    try:
+        resolved = str(path.resolve())
+        best_match_len = 0
+        best_fstype: str | None = None
+        with open("/proc/mounts") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mount_point, fstype = parts[1], parts[2]
+                if resolved.startswith(mount_point) and len(mount_point) >= best_match_len:
+                    best_match_len = len(mount_point)
+                    best_fstype = fstype
+        return best_fstype if best_fstype in _NETWORK_FS_TYPES else None
+    except OSError:
+        return None
+
 load_dotenv()
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -81,6 +103,15 @@ def load_config() -> Config:
         sys.exit(1)
 
     known_folders = [f for f in type_map if (media_root / f).is_dir()]
+
+    network_fs = _detect_network_fs(media_root)
+    if network_fs and trash_mode:
+        print(
+            f"Warning: media_root is on a network filesystem ({network_fs}). "
+            "Trash mode disabled — files will be permanently deleted. "
+            "Set trash_mode: false in config.json to suppress this warning."
+        )
+        trash_mode = False
 
     return Config(
         media_root=media_root,
