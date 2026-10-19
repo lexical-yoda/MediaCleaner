@@ -18,6 +18,25 @@ def _fmt_size(size_bytes: int) -> str:
     return f"{b:.1f} PB"
 
 
+def _watch_label(item: MediaItem) -> str:
+    """Short play history for the confirmation list.
+
+    Shown per item so that something with watch history cannot be deleted
+    without it being visible at the point of confirming.
+    """
+    stats = item.watch
+    if stats is None or not stats.known:
+        return "no watch data"
+    if stats.parts_played == 0:
+        return "never played"
+    if stats.parts_total == 1:
+        return f"played {stats.plays}x, last {stats.last_played_date}"
+    return (
+        f"{stats.parts_played}/{stats.parts_total} eps, {stats.plays} plays, "
+        f"last {stats.last_played_date}"
+    )
+
+
 class ConfirmScreen(ModalScreen[bool]):
     BINDINGS = [
         Binding("escape", "cancel", "Cancel", show=True),
@@ -28,7 +47,8 @@ class ConfirmScreen(ModalScreen[bool]):
         align: center middle;
     }
     #dialog {
-        width: 60;
+        width: 110;
+        max-width: 90%;
         height: auto;
         max-height: 30;
         border: round $error;
@@ -65,14 +85,20 @@ class ConfirmScreen(ModalScreen[bool]):
     }
     """
 
-    def __init__(self, items: list[MediaItem], trash_mode: bool) -> None:
+    ACTION_LABELS = {
+        "nas_trash": "Move to NAS Trash",
+        "local_trash": "Move to Trash",
+        "permanent": "Delete Permanently",
+    }
+
+    def __init__(self, items: list[MediaItem], delete_mode: str) -> None:
         super().__init__()
         self._items = items
-        self._trash_mode = trash_mode
+        self._delete_mode = delete_mode
 
     def compose(self) -> ComposeResult:
         total = sum(i.size_bytes for i in self._items)
-        action_label = "Move to Trash" if self._trash_mode else "Delete Permanently"
+        action_label = self.ACTION_LABELS.get(self._delete_mode, "Delete")
 
         with Static(id="dialog"):
             yield Label("Confirm Deletion", id="title")
@@ -82,8 +108,39 @@ class ConfirmScreen(ModalScreen[bool]):
                     row.append(f"  {item.display_title:<35}", style="default")
                     row.append(f"  {item.folder_label:<20}", style="dim")
                     row.append(f"  {_fmt_size(item.size_bytes):>9}", style="bold")
+                    watch = _watch_label(item)
+                    row.append(
+                        f"  {watch}",
+                        style="dim" if watch in ("never played", "no watch data") else "yellow",
+                    )
                     yield Label(row, classes="item-row")
-            yield Label(f"Total: {_fmt_size(total)} will be freed", id="total")
+            if self._delete_mode == "nas_trash":
+                freed_note = (
+                    f"Total: {_fmt_size(total)} moved to the NAS trash "
+                    "(no space freed until purged)"
+                )
+            else:
+                freed_note = f"Total: {_fmt_size(total)} will be freed"
+            yield Label(freed_note, id="total")
+            # Deleting something people have actually watched is a different
+            # decision from clearing out dead weight, so say it plainly here.
+            played = [i for i in self._items if i.watch and i.watch.parts_played]
+            if played:
+                yield Label(
+                    Text(
+                        f"{len(played)} of these have been played"
+                        + (f", most recently {max(i.watch.last_played_date for i in played)}"
+                           if any(i.watch.last_played_ts for i in played) else "")
+                        + ".",
+                        style="bold yellow",
+                    ),
+                    id="watched-warning",
+                )
+            if self._delete_mode == "permanent":
+                yield Label(
+                    Text("This cannot be undone. Media is in no backup.", style="bold red"),
+                    id="warning",
+                )
             with Static(id="buttons"):
                 yield Button(action_label, variant="error", id="confirm")
                 yield Button("Cancel", variant="default", id="cancel")

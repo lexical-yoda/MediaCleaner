@@ -1,9 +1,11 @@
 config.json
 cache.json
 deleted.log
+mediacleaner.log*
 .env
 __pycache__/
 *.pyc
 *.pyo
 .venv/
 venv/
+watch_cache.json

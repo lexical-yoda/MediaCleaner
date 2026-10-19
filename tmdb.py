@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+log = logging.getLogger("ratings")
 
 CACHE_PATH = Path(__file__).parent / "cache.json"
 TMDB_BASE = "https://api.themoviedb.org/3"
@@ -35,6 +38,7 @@ def _load_cache() -> dict[str, Any]:
         try:
             return json.loads(CACHE_PATH.read_text())
         except (json.JSONDecodeError, OSError):
+            log.exception("Could not read %s; starting with an empty cache", CACHE_PATH)
             return {}
     return {}
 
@@ -43,7 +47,7 @@ def _save_cache(cache: dict[str, Any]) -> None:
     try:
         CACHE_PATH.write_text(json.dumps(cache, indent=2))
     except OSError:
-        pass
+        log.exception("Could not write %s", CACHE_PATH)
 
 
 def _is_fresh(entry: dict[str, Any], ttl_days: int) -> bool:
@@ -89,11 +93,13 @@ class RatingsClient:
                 r = await self._client.get(f"{TMDB_BASE}{path}", params=params)
                 if r.status_code == 429:
                     retry_after = int(r.headers.get("Retry-After", "10"))
+                    log.warning("TMDB rate limited on %s; retrying in %ss", path, retry_after + 1)
                     await asyncio.sleep(retry_after + 1)
                     r = await self._client.get(f"{TMDB_BASE}{path}", params=params)
                 r.raise_for_status()
                 return r.json()
-            except (httpx.HTTPError, httpx.TimeoutException):
+            except (httpx.HTTPError, httpx.TimeoutException, ValueError) as e:
+                log.warning("TMDB %s failed: %s: %s", path, type(e).__name__, e)
                 return None
 
     async def _omdb_get(self, params: dict[str, Any]) -> dict[str, Any] | None:
@@ -105,8 +111,12 @@ class RatingsClient:
                 r = await self._client.get(OMDB_BASE, params=params)
                 r.raise_for_status()
                 data = r.json()
-                return data if data.get("Response") == "True" else None
-            except (httpx.HTTPError, httpx.TimeoutException):
+                if data.get("Response") != "True":
+                    log.warning("OMDB %s: %s", params.get("i"), data.get("Error", "no result"))
+                    return None
+                return data
+            except (httpx.HTTPError, httpx.TimeoutException, ValueError) as e:
+                log.warning("OMDB %s failed: %s: %s", params.get("i"), type(e).__name__, e)
                 return None
 
     async def fetch_ratings(

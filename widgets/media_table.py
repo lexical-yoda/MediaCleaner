@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from textual.widgets import DataTable
 from textual.reactive import reactive
 from rich.text import Text
@@ -15,7 +17,15 @@ SORT_CYCLES = [
     ("imdb", False),
     ("rt", True),
     ("rt", False),
+    ("watched", True),
+    ("watched", False),
+    ("plays", True),
+    ("plays", False),
+    ("added", True),
+    ("added", False),
 ]
+
+RECENT_DAYS = 30
 
 FOLDER_COLORS = {
     "Movies": "default",
@@ -64,6 +74,78 @@ def _fmt_rt(score: int | None, status: str) -> Text:
     return Text(f"{score}%", style=_rt_color(score))
 
 
+def _watched_color(stats) -> str:
+    """Colour the watched fraction by how close to untouched the title is."""
+    if stats.parts_played == 0:
+        return "bold red"
+    if stats.played_fraction <= 0.05:
+        return "red"
+    if stats.played_fraction < 0.5:
+        return "yellow"
+    return "green"
+
+
+def _fmt_watched(item: MediaItem) -> Text:
+    """How much of this title anyone has ever played.
+
+    A movie reads as a tick or a cross; a series reads as "played / total"
+    episodes, counting an episode as played if any user played it. The
+    distinction between "nobody watched this" and "Jellyfin does not know about
+    this" is deliberate — only the first is evidence for deleting something.
+    """
+    if item.watch_status == "pending":
+        return Text("…", style="dim")
+    if item.watch_status == "off":
+        return Text("", style="dim")
+    if item.watch_status == "error":
+        return Text("?", style="dim")
+    stats = item.watch
+    if stats is None or not stats.known:
+        return Text("—", style="dim")
+    style = _watched_color(stats)
+    if item.watch_status == "stale":
+        style = f"{style} italic"
+    if stats.parts_total == 1:
+        return Text("✓" if stats.parts_played else "✗", style=style, justify="right")
+    return Text(f"{stats.parts_played}/{stats.parts_total}", style=style, justify="right")
+
+
+def _fmt_plays(item: MediaItem) -> Text:
+    """Total play count across every user, with the number of users behind it."""
+    if item.watch_status == "pending":
+        return Text("…", style="dim")
+    if item.watch_status == "off":
+        return Text("", style="dim")
+    if item.watch_status == "error":
+        return Text("?", style="dim")
+    stats = item.watch
+    if stats is None or not stats.known:
+        return Text("—", style="dim")
+    if stats.plays == 0:
+        return Text("0", style="bold red", justify="right")
+    label = f"{stats.plays}" if stats.watchers <= 1 else f"{stats.plays} ({stats.watchers}u)"
+    return Text(label, style="default", justify="right")
+
+
+def _fmt_added(item: MediaItem) -> Text:
+    """Date the title first appeared, with a marker when it is still growing.
+
+    Recent arrivals are highlighted because an unwatched title that only landed
+    days ago is not a deletion candidate yet. A trailing "+" means content was
+    added more than 30 days after the title first appeared, which distinguishes
+    a series still receiving episodes from one that has not changed since it
+    was imported.
+    """
+    if item.added_ts is None:
+        return Text("-", style="dim")
+    label = item.added_date
+    if item.is_still_growing:
+        label += "+"
+    age_days = (time.time() - item.added_ts) / 86400
+    style = "green" if age_days <= RECENT_DAYS else "default"
+    return Text(label, style=style)
+
+
 def _fmt_size(size_bytes: int) -> str:
     b = float(size_bytes)
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -82,7 +164,7 @@ class MediaTable(DataTable):
         self._row_keys: list[str] = []
 
     def on_mount(self) -> None:
-        self.add_columns("", "Title", "Folder", "IMDb", "RT", "Size")
+        self.add_columns("", "Title", "Folder", "IMDb", "RT", "Watched", "Plays", "Size", "Added")
         self._populate()
 
     def _populate(self) -> None:
@@ -100,8 +182,30 @@ class MediaTable(DataTable):
         folder_text = Text(item.folder_label, style=folder_color)
         imdb_text = _fmt_imdb(item.imdb_rating, item.tmdb_status)
         rt_text = _fmt_rt(item.rt_score, item.tmdb_status)
+        watched_text = _fmt_watched(item)
+        plays_text = _fmt_plays(item)
         size_text = Text(_fmt_size(item.size_bytes), justify="right")
-        return sel, title_text, folder_text, imdb_text, rt_text, size_text
+        added_text = _fmt_added(item)
+        return (
+            sel, title_text, folder_text, imdb_text, rt_text,
+            watched_text, plays_text, size_text, added_text,
+        )
+
+    def refresh_all(self) -> None:
+        """Redraw every row, keeping the cursor where the user left it.
+
+        Cheaper than calling refresh_item in a loop, which costs a linear key
+        lookup per row. Used when something fills a column for the whole table
+        at once, such as the watch-data worker answering.
+        """
+        cursor = self.cursor_coordinate
+        self._populate()
+        try:
+            self.cursor_coordinate = cursor
+        except Exception:
+            # The table can be shorter than it was; falling back to the top is
+            # better than losing the refresh.
+            pass
 
     def refresh_item(self, item: MediaItem) -> None:
         key = str(item.path)
@@ -137,6 +241,28 @@ class MediaTable(DataTable):
         elif field == "rt":
             self._items.sort(
                 key=lambda x: (x.rt_score is None, (x.rt_score or 0) if ascending else -(x.rt_score or 0)),
+            )
+        elif field == "watched":
+            # Ascending puts the never-played titles at the top, which is the
+            # reason this sort exists. Titles Jellyfin knows nothing about sort
+            # last either way, like a missing rating: no watch data is not the
+            # same as no plays.
+            self._items.sort(
+                key=lambda x: (
+                    x.watch is None or not x.watch.known,
+                    x.played_fraction if ascending else -x.played_fraction,
+                ),
+            )
+        elif field == "plays":
+            self._items.sort(
+                key=lambda x: (
+                    x.watch is None or not x.watch.known,
+                    x.plays if ascending else -x.plays,
+                ),
+            )
+        elif field == "added":
+            self._items.sort(
+                key=lambda x: (x.added_ts is None, (x.added_ts or 0) if ascending else -(x.added_ts or 0)),
             )
         self._populate()
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from textual.app import ComposeResult
 from textual.screen import Screen
 from textual.widgets import Header, Footer, Label, ListView, ListItem, Static
@@ -7,6 +9,8 @@ from textual.binding import Binding
 from rich.text import Text
 
 from config import Config
+
+log = logging.getLogger("ui")
 
 
 class FolderSelectScreen(Screen):
@@ -75,7 +79,7 @@ class FolderSelectScreen(Screen):
             yield Label("space: toggle  enter: scan  q: quit", id="hint")
         yield Footer()
 
-    def action_toggle_item(self) -> None:
+    async def action_toggle_item(self) -> None:
         lv = self.query_one(ListView)
         highlighted = lv.highlighted_child
         if highlighted is None:
@@ -87,7 +91,8 @@ class FolderSelectScreen(Screen):
             self._selected.discard(folder)
         else:
             self._selected.add(folder)
-        self._refresh_list()
+        log.debug("Folder %r %s", folder, "checked" if folder in self._selected else "unchecked")
+        await self._refresh_list()
 
     def _get_folder_from_item(self, item: ListItem) -> str | None:
         for folder in self._config.known_folders:
@@ -96,10 +101,10 @@ class FolderSelectScreen(Screen):
                 return folder
         return None
 
-    def _refresh_list(self) -> None:
+    async def _refresh_list(self) -> None:
         lv = self.query_one(ListView)
         highlighted_idx = lv.index
-        lv.clear()
+        await lv.clear()
         for folder in self._config.known_folders:
             checked = folder in self._selected
             label = Text()
@@ -118,4 +123,5 @@ class FolderSelectScreen(Screen):
         self.dismiss(selected)
 
     def action_quit_app(self) -> None:
+        log.info("Quit requested from folder selector")
         self.app.exit()
